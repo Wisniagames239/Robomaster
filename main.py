@@ -1,6 +1,6 @@
 ###############################################################################################
 #  Skrypt sterujący Dji RoboMaster S1
-#
+#  Dominik Wiśniewski aka wisniagames239
 ###############################################################################################
 from robomaster import robot, camera
 import keyboard
@@ -34,26 +34,24 @@ try:
 
 except Exception as e:
     print(f" Błąd połączenia lub inicjalizacji: {e}")
-    if 'ep_robot' in locals() and ep_robot._is_connected:
-        ep_robot.close()
+    ep_robot.close()
     exit()
 
-
-
 # Prędkość robota
-speed = 100  #max 100 dla bezpieczeństwa
+speed = 100  # max 100 dla bezpieczeństwa
 
 # Większa czułość myszy do sterowania gimbalem
-gimbal_sensitivity =  0.7
+gimbal_sensitivity = 0.7
 
 try:
     mouse.move(CENTER_X, CENTER_Y)
-    time.sleep(0.05)  # Daj systemowi chwilę na przetworzenie ruchu
-    prev_mouse_x, prev_mouse_y = CENTER_X, CENTER_Y  # Inicjalizujemy prev_mouse na środku
-    print(f"Kursor myszy ustawiony na ({CENTER_X}, {CENTER_Y})") # pobranie pozycji myszy
+    time.sleep(0.05)
+    prev_mouse_x, prev_mouse_y = CENTER_X, CENTER_Y
+    print(f"Kursor myszy ustawiony na ({CENTER_X}, {CENTER_Y})")
 except Exception as e:
     print(f"Nie można pobrać pozycji myszy: {e}")
-    if ep_camera: ep_camera.stop_video_stream()
+    if ep_camera:
+        ep_camera.stop_video_stream()
     ep_robot.close()
     exit()
 
@@ -135,20 +133,20 @@ while running:
             prev_mouse_x, prev_mouse_y = current_mouse_x, current_mouse_y
 
         if abs(delta_x) > 0:
-            yaw = delta_x* gimbal_sensitivity
+            yaw = delta_x * gimbal_sensitivity
         if abs(delta_y) > 0:
-            pitch = -delta_y* gimbal_sensitivity
-        if(yaw!=last_yaw or pitch!=last_pitch):
+            pitch = -delta_y * gimbal_sensitivity
+        if (yaw != last_yaw or pitch != last_pitch):
             ep_gimbal.drive_speed(pitch_speed=pitch, yaw_speed=yaw)
             last_pitch = pitch
             last_yaw = yaw
 
         # Obliczanie o ile musi się obrócić by wyrównać z gimbalem
         effective_rotation_input = last_yaw * 0.53
-        final_w1 = wheel1*speed -effective_rotation_input
-        final_w2 = wheel2*speed -effective_rotation_input
-        final_w3 = wheel3*speed + effective_rotation_input
-        final_w4 = wheel4*speed + effective_rotation_input
+        final_w1 = wheel1 * speed - effective_rotation_input
+        final_w2 = wheel2 * speed - effective_rotation_input
+        final_w3 = wheel3 * speed + effective_rotation_input
+        final_w4 = wheel4 * speed + effective_rotation_input
         ep_chassis.drive_wheels(w1=int(final_w1), w2=int(-final_w2),
                                 w3=int(final_w3), w4=int(-final_w4))
         if keyboard.is_pressed("esc"):
