@@ -7,9 +7,40 @@ import keyboard
 import mouse
 import time
 import cv2
+#from PDcontroller import PDController
+class PDController:
+    def __init__(self, Kp, Kd, output_limits=(-100, 100), t=0.5):
+        self.Kp = Kp
+        self.Kd = Kd
+        self.output_min, self.output_max = output_limits
+        self.t = t
 
+        self.previous_error = 0
+        self.last_time = time.time()
+    def update(self, current_value):
+        current_time = time.time()
+        dt = current_time - self.last_time
+        if dt == 0:
+            return 0
+
+        error = 0 - current_value
+
+        p_term = self.Kp * error
+
+        derivative = (error - self.previous_error) / dt
+        d_term = self.Kd * derivative
+
+        output = p_term + d_term
+
+        output = max(self.output_min, min(output, self.output_max))
+
+        self.previous_error = error
+        self.last_time = current_time
+
+        return output
+
+#Główny program
 CENTER_X, CENTER_Y = 600, 400
-
 ep_robot = robot.Robot()
 ep_camera = None
 try:
@@ -60,26 +91,15 @@ except Exception as e:
     ep_robot.close()
     exit()
 
-# Parametry gimbala
-last_print_time = time.time()
-gimbal_angles = {
-    "pitch_angle": 0.0,
-    "yaw_angle": 0.0,
-    "pitch_ground_angle": 0.0,
-    "yaw_ground_angle": 0.0,
-    "last_update_time": 0.0
-}
-gimbal_data_received_count = 0 # Licznik odebranych danych
-
 # Funkcja callback dla subskrypcji kątów gimbala
-def gimbal_angle_callback(pitch, yaw, pitch_g, yaw_g):
-    global gimbal_angles, gimbal_data_received_count
-    gimbal_angles["pitch_angle"] = pitch
-    gimbal_angles["yaw_angle"] = yaw
-    gimbal_angles["pitch_ground_angle"] = pitch_g
-    gimbal_angles["yaw_ground_angle"] = yaw_g
-    gimbal_angles["last_update_time"] = time.time()
-    gimbal_data_received_count += 1
+gimbal_angles = [0.0, 0.0, 0.0, 0.0]
+def gimbal_angle_callback(*args):
+    global gimbal_angles
+    gimbal_angles = list(args[0])
+
+ok = ep_gimbal.sub_angle(freq=10, callback=gimbal_angle_callback)
+print("sub_angle started:", ok)
+time.sleep(0.5)
 
 # Instrukcje
 print(" Sterowanie robotem (klawiatura):")
@@ -90,24 +110,23 @@ print(" Gimbal: poruszaj touchpadem / myszką w lewo-prawo i góra-dół")
 
 last_pitch = 0
 last_yaw = 0
-
-#subskrybowanie gimbala, nie działa coś
-ep_gimbal.sub_angle(freq=1, callback=gimbal_angle_callback)
-time.sleep(1)
-last_print_time_status = time.time()
-
+# Initializacja PDControllera
+pid_yaw_gimbal = PDController(Kp=3, Kd=0.05, output_limits=(-100, 100), t=5)
 # Pętla główna
 running = True
 while running:
     try:
+        current_pitch = gimbal_angles[0]  # Wychylenie względem podwozia
+        current_yaw = gimbal_angles[1]  # Obrót względem podwozia
+        current_pitch_g = gimbal_angles[2]  # Wychylenie bezwzględne (względem ziemi)
+        current_yaw_g = gimbal_angles[3]  # Obrót bezwzględny (względem ziemi)
         try:
             img = ep_camera.read_cv2_image(strategy="newest", timeout=0.5)
             if img is not None:
-                #current_pitch = gimbal_angles["pitch_angle"]
-                #current_yaw = gimbal_angles["yaw_angle"]
-                #text = f"P: {current_pitch:.2f} | Y: {current_yaw:.2f}"
-                #print(text)
-                #cv2.putText(img, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
+                text = f"P: {current_pitch:.2f} | Y: {current_yaw:.2f}"
+                text2 = f"P_ground: {current_pitch_g:.2f} | Y_ground: {current_yaw_g:.2f}"
+                cv2.putText(img, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
+                cv2.putText(img, text2, (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
                 cv2.imshow("RoboMaster S1 Camera", img)
                 key = cv2.waitKey(1)
                 if key == 27:
@@ -118,7 +137,6 @@ while running:
                 pass
         except Exception as e:
             print(f"Błąd odczytu/wyświetlania klatki: {e}")
-        print(gimbal_angles) #debug
         motion_x = 0
         motion_y = 0
         motion_z = 0
@@ -182,16 +200,17 @@ while running:
             yaw_gimbal_input += delta_x * gimbal_sensitivity
         if abs(delta_y) > 0:
             pitch_gimbal_input -= delta_y * gimbal_sensitivity
-
-        if (yaw_gimbal_input != last_yaw or pitch_gimbal_input != last_pitch):
+        #Logika PD
+        pid_output_yaw = pid_yaw_gimbal.update(current_yaw)
+        if (yaw_gimbal_input!= last_yaw or pitch_gimbal_input != last_pitch):
             ep_gimbal.drive_speed(pitch_speed=pitch_gimbal_input, yaw_speed=yaw_gimbal_input)
             last_pitch = pitch_gimbal_input
             last_yaw = yaw_gimbal_input
-        effective_rotation_input = last_yaw * 0.64
-        final_w1 = wheel1 * speed - effective_rotation_input
-        final_w2 = wheel2 * speed - effective_rotation_input
-        final_w3 = wheel3 * speed + effective_rotation_input
-        final_w4 = wheel4 * speed + effective_rotation_input
+        effective_rotation_input = pid_output_yaw
+        final_w1 = wheel1 * speed + effective_rotation_input
+        final_w2 = wheel2 * speed + effective_rotation_input
+        final_w3 = wheel3 * speed - effective_rotation_input
+        final_w4 = wheel4 * speed - effective_rotation_input
         ep_chassis.drive_wheels(w1=int(final_w1), w2=int(-final_w2),
                                 w3=int(final_w3), w4=int(-final_w4))
         if keyboard.is_pressed("esc"):
