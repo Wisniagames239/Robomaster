@@ -7,19 +7,20 @@ import keyboard
 import mouse
 import time
 import cv2
+import threading
 
 # --- Stałe konfiguracyjne ---
-CENTER_X, CENTER_Y = 600, 400  # Centralna pozycja kursora myszy
-INITIAL_ROBOT_SPEED = 100  # Początkowa prędkość robota (max 150 dla bezpieczeństwa)
-GIMBAL_SENSITIVITY = 1  # Czułość myszy do sterowania gimbalem
+CENTER_X, CENTER_Y = 600, 400       # Centralna pozycja kursora myszy
+INITIAL_ROBOT_SPEED = 100        # Początkowa prędkość robota (max 150 dla bezpieczeństwa)
+GIMBAL_SENSITIVITY = 1           # Czułość myszy do sterowania gimbalem
 CAMERA_RESOLUTION = camera.STREAM_540P
+
 # Stałe do szacowania odległości
-TARGET_DISTANCE_M = 0.2  # Docelowa odległość (30 cm)
-DETECTION_DELAY_SEC = 1.0  # Wymagany czas ciągłej detekcji
-CALIBRATION_K = 0.30  # Stała optyczna (Dystans = K / h)
-# Zmienne stanu śledzenia
-person_detected_start_time = None
-auto_drive_wheel_speed = 0
+TARGET_DISTANCE_M = 1.2          # Docelowa odległość (1.2 m - widać całą sylwetkę)
+DETECTION_DELAY_SEC = 1.0        # Wymagany czas ciągłej detekcji przed ruszeniem
+CALIBRATION_K = 1.0              # Stała optyczna (Dystans = K / rozmiar)
+CMD_INTERVAL = 0.05              # Minimalny odstęp między komendami ruchu (20 Hz)
+
 
 class PDController:
     def __init__(self, kp, kd, output_limits=(-100, 100), t=1):
@@ -37,16 +38,12 @@ class PDController:
         if dt == 0:
             return 0
 
-        error = (0 - current_value)*self.t
-
+        error = (0 - current_value) * self.t
         p_term = self.kp * error
-
         derivative = (error - self.previous_error) / dt
         d_term = self.kd * derivative
 
-        output = p_term + d_term
-
-        output = max(self.output_min, min(output, self.output_max))
+        output = max(self.output_min, min(p_term + d_term, self.output_max))
 
         self.previous_error = error
         self.last_time = current_time
@@ -55,8 +52,6 @@ class PDController:
 
 
 # --- Globalne zmienne stanu ---
-
-
 ep_robot = None
 ep_chassis = None
 ep_gimbal = None
@@ -66,28 +61,33 @@ ep_battery = None
 ep_vision = None
 
 connection_active = False
+running = True
 speed = INITIAL_ROBOT_SPEED
 prev_mouse_x, prev_mouse_y = 0, 0
 gimbal_angles = [0.0, 0.0, 0.0, 0.0]
 battery = 100
-last_pitch = 0
-last_yaw = 0
-running = True
+
 mode = 1  # 1 - manual, 2 - auto tracking
 modesir = {1: "1 - Manualny", 2: "2 - Automatyczny"}
-latest_person_info = None
-last_target_pos = None
-pd_track_yaw = None
 
-# Zmienne do limitowania częstotliwości komend (Fix timeout error)
+# Zmienne śledzenia i sterowania automatycznego
+latest_person_info = None
+person_detected_start_time = None
+auto_drive_wheel_speed = 0
+filtered_size = None
+is_moving_dist = False
+
+pd_track_yaw = None
+pd_track_dist = None
+
+# Flagi wątków, okna i limitowania czasu komend
+is_firing = False
+window_initialized = False
 last_gimbal_exec_time = 0
 last_chassis_exec_time = 0
-CMD_INTERVAL = 0.05
 
 
 # --- Funkcje callback ---
-
-
 def gimbal_angle_callback(*args):
     global gimbal_angles
     gimbal_angles = list(args[0])
@@ -98,18 +98,20 @@ def battery_callback(*args):
     battery = args[0]
 
 
-# --- Inicjalizacja robota ---
-
-
+# --- Inicjalizacja i zamykanie robota ---
 def initialize_robot():
-    global ep_robot, ep_chassis, ep_gimbal, ep_camera, ep_blaster, ep_battery, ep_vision, connection_active, \
-        prev_mouse_x, prev_mouse_y, pd_track_yaw
+    global ep_robot, ep_chassis, ep_gimbal, ep_camera, ep_blaster, ep_battery, ep_vision, \
+        connection_active, prev_mouse_x, prev_mouse_y, pd_track_yaw, pd_track_dist
+
     ep_robot = robot.Robot()
     try:
         ep_robot.initialize(conn_type="ap")
         print("✅ Połączono z RoboMasterem!")
         connection_active = True
+
         pd_track_yaw = PDController(kp=350, kd=5, output_limits=(-200, 200), t=0.5)
+        pd_track_dist = PDController(kp=95, kd=18, output_limits=(-75, 75), t=1.0)
+
         ep_chassis = ep_robot.chassis
         ep_gimbal = ep_robot.gimbal
         ep_camera = ep_robot.camera
@@ -128,13 +130,14 @@ def initialize_robot():
         else:
             print("❌ Nie udało się uruchomić strumienia wideo.")
             return False
+
         try:
             mouse.move(CENTER_X, CENTER_Y)
             time.sleep(0.05)
             prev_mouse_x, prev_mouse_y = CENTER_X, CENTER_Y
             print(f"✅ Kursor myszy ustawiony na ({CENTER_X}, {CENTER_Y})")
         except Exception as e:
-            print(f"❌Nie można pobrać pozycji myszy: {e}")
+            print(f"❌ Nie można pobrać pozycji myszy: {e}")
             return False
 
         ep_gimbal.sub_angle(freq=8, callback=gimbal_angle_callback)
@@ -142,7 +145,7 @@ def initialize_robot():
         ep_battery.sub_battery_info(freq=1, callback=battery_callback)
         time.sleep(0.5)
 
-        print("✅ Połączono z RoboMasterem!")
+        print("✅ Inicjalizacja zakończona pomyślnie!")
         return True
 
     except Exception as e:
@@ -174,8 +177,26 @@ def close_robot_connection():
     connection_active = False
 
 
+# --- Obsługa strzału w osobnym wątku ---
+def fire_blaster_async():
+    global is_firing
+    try:
+        ep_blaster.set_led(brightness=100, effect="on")
+        ep_blaster.fire()
+        time.sleep(0.25)
+        ep_blaster.set_led(brightness=0, effect="off")
+        time.sleep(0.15)
+    except Exception as e:
+        print(f"⚠️ Błąd podczas strzału: {e}")
+    finally:
+        is_firing = False
+
+
+# --- Obsługa klawiatury i myszy ---
 def handle_input(pid_yaw_gimbal):
-    global running, speed, prev_mouse_x, prev_mouse_y, mode, latest_person_info
+    global running, speed, prev_mouse_x, prev_mouse_y, mode, latest_person_info, \
+        is_firing, person_detected_start_time, auto_drive_wheel_speed, filtered_size, is_moving_dist
+
     wheels = [0, 0, 0, 0]
     yaw_gimbal_input = 0
     pitch_gimbal_input = 0
@@ -194,38 +215,36 @@ def handle_input(pid_yaw_gimbal):
         wheels = [-1, -1, 1, 1]
     if keyboard.is_pressed('x'):
         wheels = [0, 0, 0, 0]
+
     if keyboard.is_pressed('r'):
         speed = (speed % 200) + 50
-        time.sleep(0.05)
+        time.sleep(0.15)
         print(f"⚙️ Ustawiona prędkość robota: {speed}")
-    if keyboard.is_pressed('f'):
-        ep_blaster.set_led(brightness=100, effect="on")
-        ep_robot.play_sound(1, 1)
-        ep_blaster.fire()
-        time.sleep(0.2)
-        ep_blaster.set_led(brightness=100, effect="off")
-        time.sleep(0.2)
+
+    if keyboard.is_pressed('f') and not is_firing:
+        is_firing = True
+        threading.Thread(target=fire_blaster_async, daemon=True).start()
 
     if keyboard.is_pressed('m'):
         mode = (mode % 2) + 1
         print(f"⚙️ Zmiana trybu na: {modesir[mode]}")
 
+        latest_person_info = None
+        person_detected_start_time = None
+        auto_drive_wheel_speed = 0
+        filtered_size = None
+        is_moving_dist = False
+
         if mode == 2:
             print("👁️ Włączanie wizji...")
             if ep_vision:
                 ep_vision.sub_detect_info(name="person", callback=on_detect_person)
-            latest_person_info = None
-            latest_person_info = None
-            person_detected_start_time = None  # Reset czasu
-            auto_drive_wheel_speed = 0  # Reset kół
-            ep_gimbal.drive_speed(pitch_speed=0, yaw_speed=0)
         else:
             print("👁️ Wyłączanie wizji...")
             if ep_vision:
                 ep_vision.unsub_detect_info(name="person")
-            latest_person_info = None
-            ep_gimbal.drive_speed(pitch_speed=0, yaw_speed=0)
 
+        ep_gimbal.drive_speed(pitch_speed=0, yaw_speed=0)
         time.sleep(0.3)
 
     if keyboard.is_pressed("esc"):
@@ -251,17 +270,19 @@ def handle_input(pid_yaw_gimbal):
     return wheels, yaw_gimbal_input, pitch_gimbal_input, pid_correction_val
 
 
+# --- Wyświetlanie obrazu i HUD ---
 def display_camera_feed(img):
-    global running, connection_active, latest_person_info
+    global running, connection_active, window_initialized
+
     if img is not None:
         if not connection_active:
             print("✅ Połączenie z RoboMasterem przywrócone.")
             connection_active = True
 
-        # --- RYSOWANIE PROSTOKĄTA WOKÓŁ CZŁOWIEKA ---
-        if latest_person_info and mode == 2:
-            img_h, img_w = img.shape[:2]
+        img_h, img_w = img.shape[:2]
 
+        # Rysowanie prostokąta wokół wykrytego człowieka
+        if latest_person_info and mode == 2:
             x_center, y_center, w_norm, h_norm = latest_person_info[0]
 
             w_pixel = int(w_norm * img_w)
@@ -277,20 +298,59 @@ def display_camera_feed(img):
             cv2.rectangle(img, (top_left_x, top_left_y), (bottom_right_x, bottom_right_y), (255, 0, 0), 3)
             cv2.circle(img, (x_pixel, y_pixel), 5, (0, 0, 255), -1)
 
-        text_gimbal = f"P: {gimbal_angles[0]:.2f} | Y: {gimbal_angles[1]:.2f}"
-        text_gimbal_g = f"P_ground: {gimbal_angles[2]:.2f} | Y_ground: {gimbal_angles[3]:.2f}"
-        text_battery = f"Battery: {battery}%"
+        # Informacje telemetryczne (lewy górny róg)
+        cv2.putText(img, f"P: {gimbal_angles[0]:.2f} | Y: {gimbal_angles[1]:.2f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+        cv2.putText(img, f"P_ground: {gimbal_angles[2]:.2f} | Y_ground: {gimbal_angles[3]:.2f}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+        cv2.putText(img, f"Battery: {battery}%", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
 
-        cv2.putText(img, text_gimbal, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
-        cv2.putText(img, text_gimbal_g, (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
-        cv2.putText(img, text_battery, (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
+        # Aktualny tryb (lewy dolny róg)
+        cv2.putText(img, f"MODE: {modesir[mode]}", (10, img_h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
 
-        text_mode = f"MODE: {modesir[mode]}"
-        cv2.putText(img, text_mode, (10, img.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2, cv2.LINE_AA)
+        # Legenda sterowania (prawy dolny róg)
+        controls_help = [
+            "STEROWANIE:",
+            "WASD - Jazda | QE - Obrot",
+            f"R - Predkosc ({speed}) | X - Stop",
+            "F - Strzal | M - Zmiana trybu",
+            "Mysz - Gimbal | ESC - Wyjscie"
+        ]
 
-        cv2.imshow("RoboMaster S1 Camera", img)
-        key = cv2.waitKey(1)
-        if key == 27:  # ESC
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.45
+        font_thickness = 1
+        line_spacing = 18
+        margin_right = 15
+        margin_bottom = 15
+
+        max_text_width = max(cv2.getTextSize(line, font, font_scale, font_thickness)[0][0] for line in controls_help)
+        total_height = len(controls_help) * line_spacing
+
+        box_x1 = img_w - max_text_width - margin_right - 8
+        box_y1 = img_h - total_height - margin_bottom
+        box_x2 = img_w - margin_right + 8
+        box_y2 = img_h - margin_bottom + 8
+
+        overlay = img.copy()
+        cv2.rectangle(overlay, (box_x1, box_y1), (box_x2, box_y2), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.5, img, 0.5, 0, img)
+
+        for i, line in enumerate(controls_help):
+            text_w = cv2.getTextSize(line, font, font_scale, font_thickness)[0][0]
+            x_pos = img_w - text_w - margin_right
+            y_pos = box_y1 + 15 + (i * line_spacing)
+            color = (0, 255, 255) if i == 0 else (255, 255, 255)
+            cv2.putText(img, line, (x_pos, y_pos), font, font_scale, color, font_thickness, cv2.LINE_AA)
+
+        window_name = "RoboMaster S1 Camera"
+        cv2.imshow(window_name, img)
+
+        if not window_initialized:
+            cv2.setWindowProperty(window_name, cv2.WND_PROP_TOPMOST, 1)
+            cv2.waitKey(1)
+            cv2.setWindowProperty(window_name, cv2.WND_PROP_TOPMOST, 0)
+            window_initialized = True
+
+        if cv2.waitKey(1) == 27:  # ESC
             print("🛑 ESC wciśnięty w oknie kamery. Zamykanie.")
             running = False
     else:
@@ -300,91 +360,86 @@ def display_camera_feed(img):
             ep_chassis.drive_wheels(w1=0, w2=0, w3=0, w4=0)
 
 
+# --- Detekcja i automatyczne śledzenie człowieka ---
 def on_detect_person(person_info):
-  global mode, latest_person_info, last_target_pos, last_gimbal_exec_time
-  global person_detected_start_time, auto_drive_wheel_speed
+    global latest_person_info, last_gimbal_exec_time, person_detected_start_time, \
+        auto_drive_wheel_speed, filtered_size, is_moving_dist
 
-  if mode != 2:
-    return
+    if mode != 2:
+        return
 
-  current_time = time.time()
+    current_time = time.time()
 
-  if person_info:
-    if last_target_pos is None:
-      selected_person = person_info[0]
-    else:
-      last_x, last_y = last_target_pos
-      min_dist = 10000
-      best_match = None
-      for p in person_info:
-        px, py, pw, ph = p
-        dist = (px - last_x) ** 2 + (py - last_y) ** 2
-        if dist < min_dist:
-          min_dist = dist
-          best_match = p
-      selected_person = best_match
+    if person_info:
+        selected_person = max(person_info, key=lambda p: p[2] * p[3])
+        latest_person_info = [selected_person]
+        x, y, w, h = selected_person
 
-    if selected_person:
-      latest_person_info = [selected_person]
-      x, y, w, h = selected_person
-      last_target_pos = (x, y)
-      print(h)
-      # --- LOGIKA ODLEGLOSCI I CZASU ---
-      if person_detected_start_time is None:
-        person_detected_start_time = current_time
+        top_edge = y - (h / 2.0)
+        bottom_edge = y + (h / 2.0)
+        is_clipped_vertically = (top_edge <= 0.04) and (bottom_edge >= 0.94)
 
-      elapsed_time = current_time - person_detected_start_time
+        if person_detected_start_time is None:
+            person_detected_start_time = current_time
+            if pd_track_dist:
+                pd_track_dist.previous_error = 0
+                pd_track_dist.last_time = current_time
 
-      # Po 3 sekundach obliczamy prędkość jazdy przód/tył
-      if elapsed_time >= DETECTION_DELAY_SEC and h > 0:
-        est_dist = CALIBRATION_K / h
-        dist_error = est_dist - TARGET_DISTANCE_M
+        if (current_time - person_detected_start_time) >= DETECTION_DELAY_SEC and h > 0:
+            if is_clipped_vertically or h >= 0.88:
+                auto_drive_wheel_speed = -30
+                filtered_size = None
+                is_moving_dist = True
+            else:
+                raw_size = max(h, w * 2.1)
+                filtered_size = raw_size if filtered_size is None else (0.25 * raw_size + 0.75 * filtered_size)
 
-        # Strefa martwa (martwe +-5cm zapobiega szarpaniu)
-        if abs(dist_error) > 0.05:
-          # Przeliczenie błędu na prędkość kół (max 80 dla bezpieczeństwa)
-          calculated_speed = dist_error * 120
-          auto_drive_wheel_speed = int(
-              max(-80, min(80, calculated_speed))
-          )
+                est_dist = CALIBRATION_K / filtered_size
+                dist_error = est_dist - TARGET_DISTANCE_M
+                threshold = 0.05 if is_moving_dist else 0.12
+
+                if abs(dist_error) > threshold:
+                    is_moving_dist = True
+                    auto_drive_wheel_speed = int(pd_track_dist.update(-dist_error))
+                else:
+                    is_moving_dist = False
+                    auto_drive_wheel_speed = 0
+                    pd_track_dist.previous_error = 0
+                    pd_track_dist.last_time = current_time
         else:
-          auto_drive_wheel_speed = 0
-      else:
+            auto_drive_wheel_speed = 0
+
+        target_y = 0.55 if top_edge <= 0.04 else 0.50
+        yaw_speed = pd_track_yaw.update(0.5 - x)
+        pitch_speed = (target_y - y) * 180
+
+        if ep_gimbal and (current_time - last_gimbal_exec_time >= CMD_INTERVAL):
+            try:
+                ep_gimbal.drive_speed(pitch_speed=pitch_speed, yaw_speed=yaw_speed)
+                last_gimbal_exec_time = current_time
+            except Exception:
+                pass
+    else:
+        latest_person_info = None
+        person_detected_start_time = None
         auto_drive_wheel_speed = 0
+        filtered_size = None
+        is_moving_dist = False
 
-      # Obrót gimbala
-      yaw_speed = pd_track_yaw.update(0.5 - x)
-      pitch_speed = (0.5 - y) * 180
-
-      if ep_gimbal and (current_time - last_gimbal_exec_time >= CMD_INTERVAL):
-        try:
-          ep_gimbal.drive_speed(pitch_speed=pitch_speed, yaw_speed=yaw_speed)
-          last_gimbal_exec_time = current_time
-        except:
-          pass
-  else:
-    # Reset gdy człowiek znika z kadru
-    latest_person_info = None
-    last_target_pos = None
-    person_detected_start_time = None
-    auto_drive_wheel_speed = 0
-
-    if ep_gimbal and (current_time - last_gimbal_exec_time >= CMD_INTERVAL):
-      try:
-        ep_gimbal.drive_speed(pitch_speed=0, yaw_speed=0)
-        last_gimbal_exec_time = current_time
-      except:
-        pass
+        if ep_gimbal and (current_time - last_gimbal_exec_time >= CMD_INTERVAL):
+            try:
+                ep_gimbal.drive_speed(pitch_speed=0, yaw_speed=0)
+                last_gimbal_exec_time = current_time
+            except Exception:
+                pass
 
 
-# --- Główna funkcja sterowania ---
-
-
+# --- Główna pętla sterowania ---
 def main_control_loop():
-    global running, connection_active, speed, last_chassis_exec_time
+    global running, last_chassis_exec_time
 
     pid_yaw_gimbal = PDController(kp=3, kd=0.05, output_limits=(-100, 100))
-    final_w1, final_w2, final_w3, final_w4 = 0, 0, 0, 0
+
     try:
         mouse.move(CENTER_X, CENTER_Y)
         time.sleep(0.05)
@@ -413,7 +468,7 @@ def main_control_loop():
             if ep_camera and connection_active:
                 try:
                     img = ep_camera.read_cv2_image(strategy="newest", timeout=1)
-                except Exception as e:
+                except Exception:
                     img = None
 
             display_camera_feed(img)
@@ -423,77 +478,53 @@ def main_control_loop():
 
             wheels, yaw_gimbal_speed, pitch_gimbal_speed, rotation_correction = handle_input(pid_yaw_gimbal)
 
-            if mode == 1:
-                if connection_active:
+            if connection_active:
+                curr_time = time.time()
+
+                if mode == 1 and (curr_time - last_chassis_exec_time >= CMD_INTERVAL):
                     final_w1 = wheels[0] * speed + int(rotation_correction)
                     final_w2 = wheels[1] * speed + int(rotation_correction)
                     final_w3 = wheels[2] * speed - int(rotation_correction)
                     final_w4 = wheels[3] * speed - int(rotation_correction)
 
-                ep_chassis.drive_wheels(w1=int(final_w1), w2=int(-final_w2), w3=int(final_w3), w4=int(-final_w4))
-                ep_gimbal.drive_speed(pitch_speed=pitch_gimbal_speed, yaw_speed=yaw_gimbal_speed)
+                    try:
+                        ep_chassis.drive_wheels(
+                            w1=int(final_w1),
+                            w2=int(-final_w2),
+                            w3=int(final_w3),
+                            w4=int(-final_w4)
+                        )
+                        ep_gimbal.drive_speed(
+                            pitch_speed=pitch_gimbal_speed,
+                            yaw_speed=yaw_gimbal_speed
+                        )
+                        last_chassis_exec_time = curr_time
+                    except Exception as e:
+                        if "timeout" not in str(e):
+                            print(f"⚠️ Błąd sterowania: {e}")
 
-
-
-            elif mode == 2:
-
-                if connection_active:
-
-                    curr_time = time.time()
-
+                elif mode == 2:
                     correction_val = int(rotation_correction)
+                    drive_offset = auto_drive_wheel_speed
+                    interval = CMD_INTERVAL if (abs(correction_val) > 1 or abs(drive_offset) > 0) else 0.2
 
-                    drive_offset = auto_drive_wheel_speed  # Dodana prędkość przód/tył z auto-odległości
-
-                    should_send = False
-
-                    # Reaguj na obrót LUB jazdę przód/tył
-
-                    if abs(correction_val) > 1 or abs(drive_offset) > 0:
-
-                        if curr_time - last_chassis_exec_time > CMD_INTERVAL:
-                            should_send = True
-
-                    else:
-
-                        if curr_time - last_chassis_exec_time > 0.2:
-                            should_send = True
-
-                    if should_send:
-
-                        # Połączenie skrętu (correction_val) z ruchem w przód/tył (drive_offset)
-
+                    if curr_time - last_chassis_exec_time > interval:
                         final_w1 = drive_offset + correction_val
-
                         final_w2 = drive_offset + correction_val
-
                         final_w3 = drive_offset - correction_val
-
                         final_w4 = drive_offset - correction_val
 
                         try:
-
                             ep_chassis.drive_wheels(
-
                                 w1=int(final_w1),
-
                                 w2=int(-final_w2),
-
                                 w3=int(final_w3),
-
-                                w4=int(-final_w4),
-
+                                w4=int(-final_w4)
                             )
-
                             last_chassis_exec_time = curr_time
-
-                        except:
-
+                        except Exception:
                             pass
-
-                time.sleep(0.02)
-            else:
-                time.sleep(0.01)
+                    time.sleep(0.02)
 
             if battery < 2 and connection_active:
                 print(f"⚠️ Niski poziom baterii ({battery}%). Zalecane podładowanie. Zatrzymywanie programu.")
